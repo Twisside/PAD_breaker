@@ -1,0 +1,11 @@
+﻿syntax = "proto3";
+
+package broker;
+
+message MessageEnvelope {
+    string url = 1;
+    string method = 2;
+    string msg = 3;            // The actual payload (stringified JSON or plain text)
+    string reply_to = 4;
+    string correlation_id = 5;
+}
