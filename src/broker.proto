@@ -1,0 +1,33 @@
+﻿syntax = "proto3";
+
+package broker;
+
+service MessageBroker {
+  // Service sends a message to the broker
+  rpc Publish (PublishRequest) returns (PublishResponse);
+
+  // Service listens for messages (Server Streaming)
+  rpc Subscribe (SubscribeRequest) returns (stream MessageEnvelope);
+}
+
+message PublishRequest {
+  string topic = 1;
+  MessageEnvelope envelope = 2;
+}
+
+message SubscribeRequest {
+  string service_name = 1;
+  string topic = 2;
+}
+
+message PublishResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MessageEnvelope {
+  string msg = 1;
+  string correlation_id = 2;
+  string method = 3;
+  string url = 4;
+}

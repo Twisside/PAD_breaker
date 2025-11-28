@@ -1,107 +1,127 @@
 ﻿const express = require('express');
 const bodyParser = require('body-parser');
-const crypto = require('crypto');
-const protobuf = require('protobufjs');
-const path = require('path');
-
+const crypto = require('crypto'); // Built-in Node.js module for UUIDs
 const registry = require('./registry');
 const persistence = require('./persistence');
 const broker = require('./broker');
 
 const app = express();
+app.use(bodyParser.json());
+
 const PORT = 8380;
 
-// --- 1. Load Protocol Buffer Schema ---
-const protoRoot = protobuf.loadSync(path.join(__dirname, 'envelope.proto'));
-const MessageEnvelope = protoRoot.lookupType("broker.MessageEnvelope");
-
-// --- 2. Middleware ---
-// Parse JSON for standard requests
-app.use(bodyParser.json());
-// Parse Raw Buffers for Protobuf requests (identified by Content-Type)
-app.use(bodyParser.raw({ type: 'application/x-protobuf', limit: '10mb' }));
-
-// --- Root Route ---
+// --- Root Route (Health Check) ---
 app.get('/', (req, res) => {
-    res.json({ status: "Online", protocols: ["JSON", "Protobuf"] });
+    res.json({
+        status: "Online",
+        message: "PAD Message Broker is running (JSON Mode)",
+        endpoints: [
+            "POST /register",
+            "POST /subscribe/:topic",
+            "POST /publish/:topic",
+            "POST /send/:service",
+            "GET /topics",
+            "GET /dlc"
+        ]
+    });
 });
 
-// --- Admin Routes (Unchanged) ---
-app.get('/topics', (req, res) => res.json(persistence.getTopics()));
-app.get('/dlc', (req, res) => res.json(persistence.getDLC()));
+// --- Admin / Setup Routes ---
 
 app.post('/register', (req, res) => {
-    registry.register(req.body.serviceName, req.body.url, req.body.healthURL);
+    const { serviceName, url, healthURL } = req.body;
+    if (!serviceName || !url) {
+        return res.status(400).send("Missing serviceName or url");
+    }
+    registry.register(serviceName, url, healthURL);
     res.send('Registered');
 });
 
 app.post('/subscribe/:topic', (req, res) => {
-    registry.subscribe(req.body.service, req.params.topic, req.body.endpoint);
-    res.json({ status: 'subscribed' });
+    const { topic } = req.params;
+    const { service, endpoint } = req.body;
+
+    if (!service || !endpoint) {
+        return res.status(400).json({ error: "Missing 'service' or 'endpoint' in request body" });
+    }
+
+    registry.subscribe(service, topic, endpoint);
+    res.json({ status: 'subscribed', topic, service, endpoint });
 });
 
-// --- UPDATED: Publish Route supporting Protobuf ---
+app.get('/topics', (req, res) => {
+    try {
+        res.json(persistence.getTopics());
+    } catch (e) {
+        res.status(500).json({ error: "Persistence Error", details: e.message });
+    }
+});
+
+app.get('/dlc', (req, res) => {
+    res.json(persistence.getDLC());
+});
+
+// --- Communication Routes ---
+
+// 1. Direct Service-to-Service Communication
+app.post('/send/:service', async (req, res) => {
+    try {
+        const result = await broker.sendToService(req.params.service, req.body.data, req.body.path);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 2. Pub/Sub Topic Publishing (Standard JSON Envelope)
 app.post('/publish/:topic', async (req, res) => {
     try {
-        let envelope = {};
+        const rawBody = req.body;
 
-        // Check Content-Type to determine how to parse
-        if (req.get('Content-Type') === 'application/x-protobuf') {
+        // Construct the Standard Envelope
+        const envelope = {
+            url: rawBody.url || "", // The sender's URL (optional)
+            method: rawBody.method || "POST",
+            // If 'msg' is present, use it. Otherwise, treat the whole body as the message.
+            msg: rawBody.msg !== undefined ? rawBody.msg : rawBody,
+            reply_to: rawBody.reply_to || "",
+            correlation_id: rawBody.correlation_id || crypto.randomUUID()
+        };
 
-            // 1. Decode Binary Buffer
-            const buffer = req.body;
-            if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-                throw new Error("Empty or invalid buffer received");
-            }
-
-            try {
-                // Decode protobuf to JS object
-                const decodedMessage = MessageEnvelope.decode(buffer);
-                // Convert to standard JS object (handling defaults)
-                envelope = MessageEnvelope.toObject(decodedMessage, {
-                    defaults: true,
-                    longs: String,
-                    enums: String,
-                    bytes: String,
-                });
-            } catch (decodeError) {
-                return res.status(400).json({ error: "Invalid Protobuf format", details: decodeError.message });
-            }
-
-        } else {
-            // Fallback to existing JSON logic
-            const rawBody = req.body;
-            envelope = {
-                url: rawBody.url || "",
-                method: rawBody.method || "POST",
-                msg: typeof rawBody.msg === 'object' ? JSON.stringify(rawBody.msg) : (rawBody.msg || ""),
-                reply_to: rawBody.reply_to || "",
-                correlation_id: rawBody.correlation_id
-            };
-        }
-
-        // Ensure Correlation ID exists
-        if (!envelope.correlation_id) {
-            envelope.correlation_id = crypto.randomUUID();
-        }
-
-        // Pass to Broker (Broker processes it as a standard JS object)
         const result = await broker.publishToTopic(req.params.topic, envelope);
 
         res.json({
             status: 'Published',
-            format: req.get('Content-Type') === 'application/x-protobuf' ? 'Protobuf' : 'JSON',
             correlation_id: envelope.correlation_id,
             details: result
         });
-
     } catch (e) {
-        console.error(e);
+        console.error("Publish Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 3. Two-Phase Commit Transaction
+app.post('/transaction/2pc', async (req, res) => {
+    try {
+        const result = await broker.twoPhaseCommit(req.body);
+        res.json(result);
+    } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
 // --- Start Server ---
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Broker running on http://localhost:${PORT}`);
+    console.log(`✅ Message Broker running on http://localhost:${PORT}`);
+});
+
+// Handle Port Conflicts (Zombie Processes)
+server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+        console.error(`❌ FATAL ERROR: Port ${PORT} is already in use!`);
+        console.error(`   Run 'taskkill /F /PID <PID>' (Windows) or 'kill -9 <PID>' (Linux) to fix it.`);
+    } else {
+        console.error("❌ Server Error:", e);
+    }
 });

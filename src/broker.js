@@ -4,46 +4,48 @@ const persistence = require('./persistence');
 
 class Broker {
 
-    // Updated: Accepts 'path' to append to the service URL
+    // 1. Send to a specific service (Load Balanced)
     async sendToService(serviceName, payload, path = '') {
-        // Ensure path starts with / if provided
         const cleanPath = path && !path.startsWith('/') ? `/${path}` : path || '';
         return this.attemptRequest(serviceName, payload, 'POST', 0, cleanPath);
     }
 
+    // 2. Publish to a Topic (Fan-out)
     async publishToTopic(topicName, payload) {
+        // Save message for durability
         persistence.addToTopic(topicName, payload);
 
-        // NEW: Get dynamic subscribers from registry
+        // Get subscribers
         const subscribers = registry.getSubscribers(topicName);
-        // subscribers = [ { serviceName: 'inventory', endpoint: '/update-stock' }, ... ]
 
         if (!subscribers || subscribers.length === 0) {
-            console.log(`No subscribers for topic ${topicName}`);
+            console.log(`ℹ️ Broker: No subscribers for topic '${topicName}'`);
             return [];
         }
 
+        console.log(`📨 Broker: Forwarding '${topicName}' to ${subscribers.length} subscribers...`);
+
+        // Send to all subscribers in parallel
         const results = await Promise.allSettled(
             subscribers.map(sub =>
                 this.sendToService(sub.serviceName, payload, sub.endpoint)
             )
         );
+
         return results;
     }
 
-    // Removed hardcoded getSubscribersForTopic (now handled by registry)
-
-    // Updated: Accepts 'path' to append to URL
+    // Internal Helper: Retry Logic & Circuit Breaker Check
     async attemptRequest(serviceName, payload, method, attempts = 0, path = '') {
         const instance = registry.getNextAvailableInstance(serviceName);
 
         if (!instance) {
-            persistence.addToDLC(payload, `No healthy instances for ${serviceName}`);
-            throw new Error(`Service Unavailable: ${serviceName}`);
+            const errorMsg = `No healthy instances available for service: ${serviceName}`;
+            console.error(`❌ Broker: ${errorMsg}`);
+            persistence.addToDLC(payload, errorMsg);
+            throw new Error(errorMsg);
         }
 
-        // Construct full URL
-        // Remove trailing slash from base URL to avoid double slashes
         const baseURL = instance.url.endsWith('/') ? instance.url.slice(0, -1) : instance.url;
         const fullURL = `${baseURL}${path}`;
 
@@ -57,11 +59,11 @@ class Broker {
             registry.reportSuccess(instance);
             return response.data;
         } catch (error) {
-            console.error(`Failed to reach ${fullURL}`);
+            console.error(`⚠️ Broker: Failed to reach ${fullURL} - ${error.message}`);
             registry.reportFailure(instance);
 
-            if (attempts < 3) {
-                console.log(`Rerouting request for ${serviceName}...`);
+            if (attempts < 2) {
+                console.log(`🔄 Broker: Retrying ${serviceName}...`);
                 return this.attemptRequest(serviceName, payload, method, attempts + 1, path);
             } else {
                 persistence.addToDLC(payload, `Max retries reached for ${serviceName}`);
@@ -70,31 +72,28 @@ class Broker {
         }
     }
 
+    // 3. Two-Phase Commit (Simplified)
     async twoPhaseCommit(transactionData) {
         const { services, data } = transactionData;
-        console.log("2PC: Phase 1 - Prepare");
+        console.log("🔄 2PC: Phase 1 - Prepare");
 
         try {
-            // Phase 1: Prepare
-            // Note: For 2PC, we assume a standard endpoint '/2pc/prepare' exists on services
             for (const svc of services) {
                 await this.attemptRequest(svc, { type: '2PC_PREPARE', data }, 'POST', 0, '/2pc/prepare');
             }
         } catch (e) {
-            console.log("2PC: Phase 1 Failed. Rolling back.");
+            console.log("❌ 2PC: Phase 1 Failed. Rolling back.");
             await this.broadcastRollback(services, data);
             return { status: 'aborted', reason: e.message };
         }
 
-        console.log("2PC: Phase 2 - Commit");
+        console.log("✅ 2PC: Phase 2 - Commit");
         try {
-            // Phase 2: Commit
             for (const svc of services) {
                 await this.attemptRequest(svc, { type: '2PC_COMMIT', data }, 'POST', 0, '/2pc/commit');
             }
             return { status: 'committed' };
         } catch (e) {
-            console.error("CRITICAL: Commit phase failed partially");
             return { status: 'error', reason: "Partial Commit Failure" };
         }
     }
